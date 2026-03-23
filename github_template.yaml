@@ -1,0 +1,197 @@
+# ========== BIẾN CẤU HÌNH (SỬA Ở ĐÂY KHI CÀI ĐẶT) ==========
+substitutions:
+  # Cấu hình thiết bị
+  device_name: "esp32-smart-fan"
+  device_friendly_name: "Smart Fan (Brightness Mode)"
+  
+  # Các chân kết nối GPIO
+  clk_pin: "GPIO26"                # Chân xuất xung PWM (LEDC) nối với Jack IN của Fan Driver
+  clk_channel: "0"                 # Kênh LEDC nội bộ ESP32
+  encoder_clk_pin: "GPIO32"        # Chân CLK của EC11
+  encoder_dt_pin: "GPIO33"         # Chân DT của EC11
+  encoder_sw_pin: "GPIO25"         # Chân SW (Nút bấm) của EC11
+  
+  # Cấu hình tính năng
+  default_frequency: "150"         # Tần số nền mặc định
+  encoder_resolution: "1"          # Cố định = 1 cho EC11 Quadrature để dập nhiễu/bật lùi
+  
+  # Thông tin mạng WiFi
+  wifi_ssid: "YOUR_WIFI_SSID"      # ĐIỀN TÊN WIFI CỦA BẠN VÀO ĐÂY
+  wifi_password: "YOUR_WIFI_PASS"  # ĐIỀN MẬT KHẨU WIFI VÀO ĐÂY
+  
+  # Khác
+  logger_baud_rate: "115200"
+
+esphome:
+  name: ${device_name}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+# ---------- WIFI CONFIG ----------
+wifi:
+  ssid: "${wifi_ssid}"
+  password: "${wifi_password}"
+  power_save_mode: none
+  reboot_timeout: 10min
+
+# ---------- LOGGING & API ----------
+logger:
+  baud_rate: ${logger_baud_rate}
+  level: DEBUG
+
+api:
+  reboot_timeout: 0s 
+
+ota:
+  - platform: esphome
+
+# ========== BIẾN LƯU TẦN SỐ NỀN ==========
+globals:
+  - id: freq_hz
+    type: int
+    restore_value: yes
+    initial_value: '${default_frequency}'
+  - id: disable_sync_until
+    type: uint32_t
+    initial_value: '0'
+
+# ---------- XUẤT XUNG CLK THỰC TẾ ----------
+output:
+  - platform: ledc
+    id: clk_out
+    pin: ${clk_pin}
+    channel: ${clk_channel}
+    frequency: ${default_frequency}Hz
+    inverted: false
+
+# ---------- TEMPLATE OUTPUT (CHUYỂN % -> HZ) ----------
+# Nhận mức thay đổi độ sáng 0.0 -> 1.0 (0-100%) từ bóng đèn ảo
+  - platform: template
+    id: brightness_to_freq_output
+    type: float
+    write_action:
+      - lambda: |-
+          // Khóa ghi đè trong vòng 1 giây kể từ lần quay cuối cùng (chống nhảy ngược)
+          if (millis() > id(disable_sync_until)) {
+            int expected_knob = (int)((state * 100.0f) / 3.0f + 0.5f);
+            if (id(knob).state != expected_knob) {
+              id(knob).set_value(expected_knob);
+            }
+          }
+
+          if (state <= 0.01) {
+            // Độ sáng < 1% (tắt) -> dừng xung PWM
+            id(clk_out).set_level(0.0f);
+          } else {
+            // Dải hoạt động: 100Hz -> 400Hz
+            // Chênh lệch (delta) = 400 - 100 = 300 | 1% = 3Hz
+            int new_freq = (int)(state * 300.0f) + 100;
+            id(freq_hz) = clamp(new_freq, 100, 400);
+            
+            // Cập nhật tần số mới
+            id(apply_freq).execute();
+          }
+
+# ---------- SCRIPT ÁP TẦN SỐ VÀ DUTY 50% ----------
+script:
+  - id: apply_freq
+    mode: restart
+    then:
+      - output.ledc.set_frequency:
+          id: clk_out
+          frequency: !lambda "return id(freq_hz);"
+      - output.set_level:
+          id: clk_out
+          level: 50% # Luôn cố định 50% duty vuông cho quạt BLDC
+          
+# ---------- ENTITY ĐÈN / QUẠT TRONG HA ----------
+light:
+  - platform: monochromatic
+    name: "${device_friendly_name}"
+    id: fan_light
+    output: brightness_to_freq_output
+    gamma_correct: 1.0 # TẮT gamma correction để Slider tuyến tính
+    default_transition_length: 0s # Tắt trễ transition tránh lag quá mức
+    restore_mode: RESTORE_DEFAULT_OFF
+
+# ---------- NÚM XOAY EC11 ----------
+sensor:
+  - platform: rotary_encoder
+    id: knob
+    name: "Encoder EC11" 
+    pin_a:
+      number: ${encoder_clk_pin}
+      mode:
+        input: true
+        pullup: true
+    pin_b:
+      number: ${encoder_dt_pin}
+      mode:
+        input: true
+        pullup: true
+    resolution: ${encoder_resolution}
+    
+    # Từ 0 đến 33 khấc (Mỗi khấc 3%. 0=0%, 33=99~100%) dập lỗi nhảy số cứng
+    min_value: 0
+    max_value: 33
+    on_value:
+      - lambda: |-
+          // Thiết lập cờ chặn ghi đè từ HA trong 1000ms
+          id(disable_sync_until) = millis() + 1000;
+          
+          float b = (x * 3.0f) / 100.0f;
+          if (b >= 0.99f) b = 1.0f; // Khóa 100% tại max
+          
+          if (b <= 0.01f) {
+            // Chặn lệnh thừa ở mức 0%
+            if (id(fan_light).current_values.get_state() == 0.0f || !id(fan_light).current_values.is_on()) {
+               return;
+            }
+            id(fan_light).turn_off().perform();
+          } else {
+            auto call = id(fan_light).turn_on();
+            call.set_brightness(b);
+            call.perform();
+          }
+    internal: true
+
+  # Cảm biến độ mạnh tín hiệu WiFi
+  - platform: wifi_signal
+    id: rssi_dbm
+    name: "WiFi RSSI"
+    update_interval: 30s
+    filters:
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+          
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "WiFi IP"
+    ssid:
+      name: "WiFi SSID"
+
+# ---------- NÚT NHẤN TRÊN ENCODER (BẬT/TẮT QUẠT) ----------
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: ${encoder_sw_pin}
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: "Nút ấn EC11"
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      - light.toggle: fan_light
+
+button:
+  - platform: restart
+    id: restart_button
+    name: "Restart ESP32"

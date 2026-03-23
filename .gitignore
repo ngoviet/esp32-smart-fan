@@ -1,0 +1,9 @@
+# Gitignore settings for ESPHome
+/.esphome/
+/secrets.yaml
+
+# Bỏ qua file cấu hình thật của user (chứa mật khẩu WiFi)
+/main.yaml
+/backup/
+/*.bin
+/_*.yaml
